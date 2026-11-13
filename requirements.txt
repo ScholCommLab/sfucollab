@@ -1,0 +1,7 @@
+dash>=4.5,<5
+dash-cytoscape>=1.0.2,<2
+networkx>=3.7,<4
+pandas>=3.0,<4
+plotly>=7.1,<8
+pycountry>=24.6
+gunicorn>=27.0
