@@ -1,19 +1,24 @@
 """
-SIAT research dashboard.
+FCAT research dashboard.
 
-Reads siat_data/works.json and siat_data/roster.json (written by the collection
-notebook) and serves an interactive dashboard in the browser.
+Reads siat_data/works.json, roster.json and people.json (written by the collection
+notebook) and serves an interactive dashboard in the browser. A School filter at the
+top switches between FCAT as a whole and one school at a time.
 
-    pip install dash dash-cytoscape networkx pandas plotly
+    pip install -r requirements.txt
     python app.py            # then open http://127.0.0.1:8050
 
 Environment variables:
-    SIAT_DATA   folder holding works.json and roster.json (default: siat_data)
+    SIAT_DATA   folder holding the data files (default: siat_data)
     PORT        port to serve on (default: 8050)
 
-Updating: re-run the collection notebook. The app notices the new files on the
-next interaction (no restart needed). Refresh the page to pick up roster changes
-in the "focus" dropdowns.
+How the School filter works: the selected school's faculty are the "members"; everyone
+else, including faculty from the other schools, counts as an external co-author. Only
+works with at least one member of the selected school are used, so picking SIAT gives
+the SIAT-only picture, and "All of FCAT" treats all three schools as members.
+
+Updating: re-run the collection notebook. The app notices new files on the next
+interaction (no restart needed). Refresh the page to pick up roster changes.
 """
 import itertools
 import json
@@ -40,30 +45,54 @@ except ImportError:
 DATA_DIR = Path(os.environ.get("SIAT_DATA", "siat_data"))
 WORKS_FILE = DATA_DIR / "works.json"
 ROSTER_FILE = DATA_DIR / "roster.json"
+PEOPLE_FILE = DATA_DIR / "people.json"          # name -> {school, rank, group}
+LEGACY_GROUPS_FILE = DATA_DIR / "groups.json"   # older data: name -> group (all assumed SIAT)
+
 RED, BLUE, GREY = "#c8102e", "#1f6feb", "#9aa5b1"
 GROUP_COLORS = {"Research faculty": RED, "Teaching faculty": BLUE}
 DEFAULT_GROUP = "Research faculty"
+SCHOOL_COLORS = {"SIAT": RED, "CMNS": "#2a9d8f", "SCA": "#e9a000"}
+SCHOOL_FALLBACK = "#7b5ea7"
+SCHOOL_NAMES = {"SIAT": "SIAT (Interactive Arts and Technology)", "CMNS": "CMNS (Communication)",
+                "SCA": "SCA (Contemporary Arts)"}
+ALL = "ALL"
+ALL_LABEL = "All of FCAT"
+DEFAULT_SCHOOL = "SIAT"
 DEFAULT_YEARS = 5
 
 
+def school_color(s):
+    return SCHOOL_COLORS.get(s, SCHOOL_FALLBACK)
+
+
+def school_label(s):
+    return ALL_LABEL if s in (None, ALL) else SCHOOL_NAMES.get(s, s)
+
+
 # --------------------------------------------------------------------------- data
+def _mt(p):
+    return p.stat().st_mtime if p.exists() else 0
+
+
 def _stamp():
-    g = DATA_DIR / "groups.json"
-    return (WORKS_FILE.stat().st_mtime, ROSTER_FILE.stat().st_mtime, g.stat().st_mtime if g.exists() else 0)
+    return (WORKS_FILE.stat().st_mtime, ROSTER_FILE.stat().st_mtime, _mt(PEOPLE_FILE), _mt(LEGACY_GROUPS_FILE))
 
 
 @lru_cache(maxsize=1)
 def _load(stamp):
     blob = json.loads(WORKS_FILE.read_text())
     roster = json.loads(ROSTER_FILE.read_text())
-    groups_file = DATA_DIR / "groups.json"
-    groups = json.loads(groups_file.read_text()) if groups_file.exists() else {}
-    groups = {n: groups.get(n, DEFAULT_GROUP) for n in roster}
+    people = json.loads(PEOPLE_FILE.read_text()) if PEOPLE_FILE.exists() else {}
+    legacy = json.loads(LEGACY_GROUPS_FILE.read_text()) if LEGACY_GROUPS_FILE.exists() else {}
+    people = {n: {"school": (people.get(n) or {}).get("school") or "SIAT",
+                  "rank": (people.get(n) or {}).get("rank") or "",
+                  "group": (people.get(n) or {}).get("group") or legacy.get(n) or DEFAULT_GROUP}
+              for n in roster}
     full = lambda i: i if i.startswith("http") else "https://openalex.org/" + i
     id2m = {full(i): name for name, ids in roster.items() for i in ids}
 
     labels, keys, rows = {}, {}, []
-    ext, topic, inst_info = {}, {}, {}
+    info, topic, inst_info = {}, {}, {}     # info[wid][author key] = (institution ids, country codes)
     for wid, w in blob["works"].items():
         ks, members = [], []
         for au in w.get("authorships") or []:
@@ -79,15 +108,16 @@ def _load(stamp):
             else:
                 k = aid.rsplit("/", 1)[-1]
                 labels[k] = a.get("display_name") or k
-                insts = []
-                for i in au.get("institutions") or []:
-                    if i.get("id"):
-                        inst_info[i["id"]] = (i.get("display_name") or i["id"], i.get("country_code") or "", i.get("type") or "")
-                        insts.append(i["id"])
-                ccs = list(au.get("countries") or []) or sorted({inst_info[i][1] for i in insts if inst_info[i][1]})
-                ext.setdefault(wid, {})[k] = (tuple(insts), tuple(ccs))
-            if k not in ks:
-                ks.append(k)
+            if k in ks:
+                continue
+            ks.append(k)
+            insts = []
+            for i in au.get("institutions") or []:
+                if i.get("id"):
+                    inst_info[i["id"]] = (i.get("display_name") or i["id"], i.get("country_code") or "", i.get("type") or "")
+                    insts.append(i["id"])
+            ccs = list(au.get("countries") or []) or sorted({inst_info[i][1] for i in insts if inst_info[i][1]})
+            info.setdefault(wid, {})[k] = (tuple(insts), tuple(ccs))
         keys[wid] = ks
         pt = w.get("primary_topic") or {}
         if pt.get("id"):
@@ -99,21 +129,46 @@ def _load(stamp):
                          type=w.get("type") or "unknown", cited=w.get("cited_by_count") or 0,
                          members=members))
     df = pd.DataFrame(rows, columns=["id", "title", "year", "type", "cited", "members"])
-    return dict(roster=set(roster), groups=groups, ext=ext, topic=topic, inst=inst_info, labels=labels, keys=keys, works=blob["works"], df=df,
-                fetched=blob.get("fetched", "unknown"))
+    return dict(roster=set(roster), people=people, info=info, topic=topic, inst=inst_info, labels=labels,
+                keys=keys, works=blob["works"], df=df, fetched=blob.get("fetched", "unknown"))
 
 
 def corpus():
     return _load(_stamp())
 
 
+@lru_cache(maxsize=16)
+def _school_members(stamp, school):
+    c = _load(stamp)
+    if school in (None, ALL):
+        return frozenset(c["roster"])
+    return frozenset(n for n in c["roster"] if c["people"][n]["school"] == school)
+
+
+def school_members(school):
+    return _school_members(_stamp(), school)
+
+
+def member_options(school):
+    return [{"label": n, "value": n} for n in sorted(school_members(school))]
+
+
 def window(n_years, end_year):
     return end_year - n_years + 1, end_year
 
 
-def work_ids_in(c, start, end):
-    df = c["df"]
-    return df.loc[df.year.between(start, end), "id"].tolist()
+@lru_cache(maxsize=64)
+def work_ids(stamp, start, end, school):
+    """Works in [start, end] with at least one member of the school (all years: start=-9999, end=9999)."""
+    c, M = _load(stamp), _school_members(stamp, school)
+    d = c["df"]
+    ok = d.members.map(lambda ms: bool(M.intersection(ms))) & d.year.between(start, end)
+    return tuple(d.loc[ok, "id"])
+
+
+def externals(c, wid, M):
+    """Authors of a work who are not members of the selected school: [(key, (institutions, countries))]."""
+    return [(k, v) for k, v in c["info"].get(wid, {}).items() if k not in M]
 
 
 def h_index(cites):
@@ -123,11 +178,11 @@ def h_index(cites):
 
 # ------------------------------------------------------------------------- graphs
 @lru_cache(maxsize=32)
-def co_graph(stamp, start, end, max_authors):
+def co_graph(stamp, start, end, max_authors, school):
     """Undirected co-authorship graph. Edge weight = number of joint works."""
     c = corpus()
     G, cnt = nx.Graph(), Counter()
-    for wid in work_ids_in(c, start, end):
+    for wid in work_ids(stamp, start, end, school):
         ks = c["keys"][wid]
         if len(ks) > max_authors:
             continue
@@ -145,17 +200,20 @@ def co_graph(stamp, start, end, max_authors):
 
 
 @lru_cache(maxsize=32)
-def ci_graph(stamp, start, end, max_authors):
-    """Directed graph: citing author -> cited author, within the collected corpus.
+def ci_graph(stamp, start, end, max_authors, school):
+    """Directed graph: citing author -> cited author, within the school's corpus.
     Citing works are limited to the window; cited works can be of any year."""
     c = corpus()
     keys = c["keys"]
+    allowed = frozenset(work_ids(stamp, -9999, 9999, school))
     G = nx.DiGraph()
-    for wid in work_ids_in(c, start, end):
+    for wid in work_ids(stamp, start, end, school):
         citing = keys[wid]
         if len(citing) > max_authors:
             continue
         for ref in c["works"][wid].get("referenced_works") or []:
+            if ref not in allowed:
+                continue
             cited = keys.get(ref)
             if not cited or len(cited) > max_authors:
                 continue
@@ -187,19 +245,25 @@ def prune(G, roster, include_ext, ext_ext, min_ties, top_n, min_edge, focus):
     if not include_ext:
         H.remove_nodes_from([n for n in H if n not in roster])
     else:
-        ties = Counter()  # weight of links from each external author to SIAT members
+        ties = Counter()  # weight of links from each external author to members
         for u, v, d in H.edges(data=True):
             if u in roster and v not in roster:
                 ties[v] += d["weight"]
             elif v in roster and u not in roster:
                 ties[u] += d["weight"]
-        keep = {n for n, t in ties.most_common(top_n) if t >= min_ties}
+        ranked = sorted(ties.items(), key=lambda kv: (-kv[1], str(kv[0])))   # strongest first; ties broken by key, so runs repeat
+        keep = {n for n, t in ranked[:top_n] if t >= min_ties}
         H.remove_nodes_from([n for n in H if n not in roster and n not in keep])
     return H
 
 
-def to_elements(H, roster, value_label, equal=False):
-    labels, groups = corpus()["labels"], corpus()["groups"]
+def member_color(p, mode):
+    return school_color(p["school"]) if mode == "school" else GROUP_COLORS.get(p["group"], RED)
+
+
+def to_elements(H, roster, value_label, equal=False, mode="group"):
+    c = corpus()
+    labels, people = c["labels"], c["people"]
     nb = defaultdict(Counter)
     for u, v, d in H.edges(data=True):
         nb[u][v] += d["weight"]
@@ -207,20 +271,21 @@ def to_elements(H, roster, value_label, equal=False):
     vmax = max([d.get("value", 0) for _, d in H.nodes(data=True)] or [1]) or 1
     els = []
     for n, d in H.nodes(data=True):
-        siat = n in roster
+        member = n in roster
         val = d.get("value", 0)
         if equal:
-            size = 30 if siat else 12
-        else:  # area grows with value, relative to the biggest node shown; SIAT members never shrink below 16
+            size = 30 if member else 12
+        else:  # area grows with value, relative to the biggest node shown; members never shrink below 16
             size = 6 + 54 * math.sqrt(val / vmax)
-            if siat:
+            if member:
                 size = max(size, 16)
         top = ", ".join(f"{labels[m]} ({w})" for m, w in nb[n].most_common(6))
+        p = people.get(n)
+        kind = f'{p["school"]}, {p["rank"] or p["group"]}' if (member and p) else "External author"
         els.append({"data": {"id": n, "label": labels[n], "size": round(size, 1), "value": val,
-                             "value_label": value_label,
-                             "kind": groups[n] if siat else "External author",
-                             "color": GROUP_COLORS.get(groups[n], RED) if siat else GREY, "nbrs": top},
-                    "classes": "siat" if siat else "ext"})
+                             "value_label": value_label, "kind": kind,
+                             "color": member_color(p, mode) if member else GREY, "nbrs": top},
+                    "classes": "siat" if member else "ext"})
     for u, v, d in H.edges(data=True):
         els.append({"data": {"source": u, "target": v, "weight": d["weight"]},
                     "classes": "core" if (u in roster and v in roster) else "periph"})
@@ -257,33 +322,51 @@ LAYOUTS = {
 }
 
 
-def graph_view(directed, n_years, end_year, opts, min_ties, top_n, min_edge, max_auth, focus, layout_name,
-               size_mode="scaled"):
+def legend_children(items):
+    dot = lambda col: html.Span(style={"display": "inline-block", "width": "11px", "height": "11px",
+                                       "borderRadius": "50%", "background": col, "marginRight": "5px"})
+    return [html.Span([dot(col), name], style={"marginRight": "18px"}) for name, col in items]
+
+
+def graph_view(directed, n_years, end_year, school, opts, min_ties, top_n, min_edge, max_auth, focus, layout_name,
+               size_mode="scaled", color_mode="auto"):
     c = corpus()
+    M = school_members(school)
     start, end = window(n_years, end_year)
     build = ci_graph if directed else co_graph
-    G = build(_stamp(), start, end, max_auth)
-    H = prune(G, c["roster"], "ext" in opts, "extext" in opts, min_ties, top_n, min_edge, focus)
-    els = to_elements(H, c["roster"], "Citations received within the corpus" if directed else "Works in window",
-                      equal=size_mode == "equal")
+    G = build(_stamp(), start, end, max_auth, school)
+    H = prune(G, M, "ext" in opts, "extext" in opts, min_ties, top_n, min_edge, focus)
+    mode = ("school" if school in (None, ALL) else "group") if color_mode in (None, "auto") else color_mode
+    els = to_elements(H, M, "Citations received within the corpus" if directed else "Works in window",
+                      equal=size_mode == "equal", mode=mode)
     max_w = max([d["weight"] for _, _, d in H.edges(data=True)] or [1])
-    n_siat = sum(1 for n in H if n in c["roster"])
-    stats = (f"{H.number_of_nodes()} nodes ({n_siat} SIAT, {H.number_of_nodes() - n_siat} external), "
+    inside = [n for n in H if n in M]
+    scope = "FCAT" if school in (None, ALL) else school
+    stats = (f"{H.number_of_nodes()} nodes ({len(inside)} {scope} faculty, {H.number_of_nodes() - len(inside)} external), "
              f"{H.number_of_edges()} edges, {start}-{end}. Click a node for details.")
-    return els, stylesheet(directed, max_w, "labels" in opts), LAYOUTS[layout_name], stats
+    if mode == "school":
+        present = sorted({c["people"][n]["school"] for n in inside}) or sorted({p["school"] for p in c["people"].values()})
+        items = [(s, school_color(s)) for s in present]
+    else:
+        present = [g for g in GROUP_COLORS if any(c["people"][n]["group"] == g for n in inside)] or list(GROUP_COLORS)
+        items = [(g, GROUP_COLORS[g]) for g in present]
+    items.append(("External author", GREY))
+    return els, stylesheet(directed, max_w, "labels" in opts), LAYOUTS[layout_name], stats, legend_children(items)
 
 
 # ----------------------------------------------------------------------- overview
-def overview_view(n_years, end_year):
+def overview_view(n_years, end_year, school):
     c = corpus()
+    M = school_members(school)
     start, end = window(n_years, end_year)
-    df = c["df"]
-    d = df[df.year.between(start, end)]
+    ids = set(work_ids(_stamp(), start, end, school))
+    d = c["df"][c["df"].id.isin(ids)]
     per_member = defaultdict(list)
     for r in d.itertuples():
         for m in r.members:
-            per_member[m].append(r.cited)
-    ext_authors = {k for wid in d.id for k in c["keys"][wid] if k not in c["roster"]}
+            if m in M:
+                per_member[m].append(r.cited)
+    ext_authors = {k for wid in d.id for k in c["keys"][wid] if k not in M}
 
     years = list(range(start, end + 1))
     outs = d.groupby("year").size().reindex(years, fill_value=0)
@@ -294,7 +377,7 @@ def overview_view(n_years, end_year):
         data = pd.DataFrame({"label": list(x), "n": list(y)})
         fig = px.bar(data, x="n" if horizontal else "label", y="label" if horizontal else "n",
                      title=title, orientation="h" if horizontal else "v")
-        fig.update_traces(marker_color=RED)
+        fig.update_traces(marker_color=school_color(school) if school not in (None, ALL) else RED)
         fig.update_layout(height=300, margin=dict(t=40, b=30, l=40, r=10),
                           xaxis_title=None, yaxis_title=None, xaxis_type="category" if not horizontal else None)
         return fig
@@ -303,9 +386,10 @@ def overview_view(n_years, end_year):
     f_cit = bar([str(y) for y in years], cites.values, "Citations to date, by publication year")
     f_typ = bar(list(types.index), types.values, "Outputs by type", horizontal=True)
 
-    table = pd.DataFrame([dict(author=m, group=c["groups"][m], outputs=len(cs), citations=sum(cs), h_index=h_index(cs))
+    table = pd.DataFrame([dict(author=m, school=c["people"][m]["school"], group=c["people"][m]["group"],
+                               outputs=len(cs), citations=sum(cs), h_index=h_index(cs))
                           for m, cs in per_member.items()],
-                         columns=["author", "group", "outputs", "citations", "h_index"])
+                         columns=["author", "school", "group", "outputs", "citations", "h_index"])
     table = table.sort_values("citations", ascending=False)
 
     def card(label, value):
@@ -313,8 +397,9 @@ def overview_view(n_years, end_year):
                          html.Div(label, style={"color": "#666", "fontSize": "13px"})], style=CARD)
 
     kpis = [card("Outputs (unique works)", len(d)), card("Citations to date", int(d.cited.sum())),
-            card("SIAT members with outputs", len(per_member)), card("External co-authors", len(ext_authors))]
-    label = f"Showing {start}-{end} ({n_years} year{'s' if n_years != 1 else ''}). Data pulled {c['fetched'][:16]}."
+            card("Faculty with outputs", len(per_member)), card("External co-authors", len(ext_authors))]
+    label = (f"{school_label(school)}: {len(M)} faculty on the roster. Showing {start}-{end} "
+             f"({n_years} year{'s' if n_years != 1 else ''}). Data pulled {c['fetched'][:16]}.")
     return label, kpis, f_out, f_cit, f_typ, table.to_dict("records")
 
 
@@ -339,9 +424,9 @@ def iso3(cc):
     return None
 
 
-def selected_members(groups_sel, members_sel):
+def selected_members(groups_sel, members_sel, school):
     c = corpus()
-    base = {m for m in c["roster"] if c["groups"][m] in set(groups_sel or [])}
+    base = {m for m in school_members(school) if c["people"][m]["group"] in set(groups_sel or [])}
     if members_sel:
         base &= set(members_sel)
     return tuple(sorted(base))
@@ -366,12 +451,13 @@ def _new_person():
     return dict(works=set(), members=set(), insts=Counter(), ctrs=Counter())
 
 
-@lru_cache(maxsize=1)
-def _filter_options(stamp):
-    c = corpus()
+@lru_cache(maxsize=8)
+def _filter_options(stamp, school):
+    c = _load(stamp)
+    M = _school_members(stamp, school)
     cw, iw = defaultdict(set), defaultdict(set)
-    for wid, d in c["ext"].items():
-        for insts, ccs in d.values():
+    for wid in work_ids(stamp, -9999, 9999, school):
+        for k, (insts, ccs) in externals(c, wid, M):
             for i in insts:
                 iw[i].add(wid)
             for cc in ccs:
@@ -383,23 +469,23 @@ def _filter_options(stamp):
 
 
 @lru_cache(maxsize=32)
-def collab_stats(stamp, start, end, max_authors, members, exclude_sfu):
-    """External collaborations of the selected SIAT members. A joint work counts once per institution/country."""
+def collab_stats(stamp, start, end, max_authors, members, exclude_sfu, school):
+    """External collaborations of the selected members. A joint work counts once per institution/country."""
     c = corpus()
-    S, names = set(members), c["inst"]
+    S, M, names = set(members), school_members(school), c["inst"]
     inst = defaultdict(lambda: dict(works=set(), people=set(), members=set()))
     ctry = defaultdict(lambda: dict(works=set(), people=set(), insts=set(), members=set()))
     people = defaultdict(_new_person)
     heat = defaultdict(lambda: defaultdict(set))
     joint, n_slots, n_aff = set(), 0, 0
-    for wid in work_ids_in(c, start, end):
+    for wid in work_ids(stamp, start, end, school):
         ks = c["keys"][wid]
         if len(ks) > max_authors:
             continue
         mem = [k for k in ks if k in S]
         if not mem:
             continue
-        for k, (insts, ccs) in c["ext"].get(wid, {}).items():
+        for k, (insts, ccs) in externals(c, wid, M):
             n_slots += 1
             n_aff += bool(insts or ccs)
             joint.add(wid)
@@ -476,16 +562,16 @@ def country_map(df, exclude_canada):
     return fig
 
 
-def collab_view(n_years, end_year, groups_sel, members_sel, max_auth, opts, top_n):
+def collab_view(n_years, end_year, school, groups_sel, members_sel, max_auth, opts, top_n):
     start, end = window(n_years, end_year)
-    S = selected_members(groups_sel, members_sel)
+    S = selected_members(groups_sel, members_sel, school)
     if not S:
         e = empty_fig("Select at least one faculty group")
         return "No members selected.", e, [], e, [], e, []
-    st = collab_stats(_stamp(), start, end, max_auth, S, "nosfu" in opts)
+    st = collab_stats(_stamp(), start, end, max_auth, S, "nosfu" in opts, school)
     inst, ctry = st["inst"], st["country"]
     pct = 100 * st["n_aff"] / st["n_slots"] if st["n_slots"] else 0
-    summary = (f"{len(S)} SIAT members, {start}-{end}: {st['n_works']} works with external co-authors; "
+    summary = (f"{len(S)} faculty ({'FCAT' if school in (None, ALL) else school}), {start}-{end}: {st['n_works']} works with external co-authors; "
                f"{len(inst)} institutions in {len(ctry)} countries; {len(st['people'])} external collaborators. "
                f"OpenAlex has no affiliation for {st['n_slots'] - st['n_aff']} of {st['n_slots']} external author "
                f"slots ({100 - pct:.0f}%); those authors are missing from institution and country views.")
@@ -495,22 +581,22 @@ def collab_view(n_years, end_year, groups_sel, members_sel, max_auth, opts, top_
     else:
         bar = px.bar(top, x="works", y="institution", orientation="h", hover_data=["country", "collaborators", "siat_members"],
                      title=f"Top {len(top)} institutions by joint works")
-        bar.update_traces(marker_color=RED)
+        bar.update_traces(marker_color=school_color(school) if school not in (None, ALL) else RED)
         bar.update_layout(height=max(300, 24 * len(top) + 90), margin=dict(t=40, b=30, l=10, r=10),
                           xaxis_title="Joint works", yaxis_title=None, yaxis=dict(automargin=True))
     return (summary, bar, inst.drop(columns="id").to_dict("records"), country_map(ctry, "nocan" in opts),
             ctry.drop(columns="code").to_dict("records"),
-            heatmap_fig(st["heat"], "Joint works: SIAT member by institution (top 15)"), st["people"][:500])
+            heatmap_fig(st["heat"], "Joint works: faculty member by institution (top 15)"), st["people"][:500])
 
 
 @lru_cache(maxsize=32)
-def topic_rows(stamp, start, end, max_authors, members, scope, country, inst_id):
-    """One row per (work, selected SIAT member), using OpenAlex's primary topic for each work."""
+def topic_rows(stamp, start, end, max_authors, members, scope, country, inst_id, school):
+    """One row per (work, selected member), using OpenAlex's primary topic for each work."""
     c = corpus()
-    S = set(members)
+    S, M = set(members), school_members(school)
     need_ext = scope == "collab" or bool(country) or bool(inst_id)
     out = []
-    for wid in work_ids_in(c, start, end):
+    for wid in work_ids(stamp, start, end, school):
         t = c["topic"].get(wid)
         if not t:
             continue
@@ -519,33 +605,34 @@ def topic_rows(stamp, start, end, max_authors, members, scope, country, inst_id)
         if not mem:
             continue
         if need_ext:
-            ex = c["ext"].get(wid, {})
+            ex = externals(c, wid, M)
             if len(ks) > max_authors or not ex:
                 continue
-            if country and not any(country in ccs for _, ccs in ex.values()):
+            if country and not any(country in ccs for _, (_, ccs) in ex):
                 continue
-            if inst_id and not any(inst_id in insts for insts, _ in ex.values()):
+            if inst_id and not any(inst_id in insts for _, (insts, _) in ex):
                 continue
         out.extend((wid, m) + t for m in mem)
     return pd.DataFrame(out, columns=["wid", "member", "domain", "field", "subfield", "topic"])
 
 
-def topic_view(n_years, end_year, groups_sel, members_sel, max_auth, scope, country, inst_id):
+def topic_view(n_years, end_year, school, groups_sel, members_sel, max_auth, scope, country, inst_id):
     c = corpus()
     start, end = window(n_years, end_year)
-    S = selected_members(groups_sel, members_sel)
+    S = selected_members(groups_sel, members_sel, school)
     e = empty_fig("No data for this selection")
     if not c["topic"]:
         return "No topic data in works.json. Re-run the collection notebook (it now fetches topics).", e, e, []
-    rows = topic_rows(_stamp(), start, end, max_auth, S, scope, country, inst_id)
+    rows = topic_rows(_stamp(), start, end, max_auth, S, scope, country, inst_id, school)
     if rows.empty:
         return "No works with a topic classification match this selection.", e, e, []
     works = rows.drop_duplicates("wid")
     filtered = scope == "collab" or country or inst_id
     cover = ""
     if not filtered:
-        d = c["df"][c["df"].year.between(start, end)]
-        total = sum(1 for ms in d.members if S and set(S) & set(ms))
+        ids = set(work_ids(_stamp(), start, end, school))
+        d = c["df"][c["df"].id.isin(ids)]
+        total = sum(1 for ms in d.members if set(S) & set(ms))
         cover = f" of {total} works in the window ({100 * len(works) / max(total, 1):.0f}%)"
     summary = (f"{len(works)} works{cover} have an OpenAlex topic and are shown (each work counted once, by its primary topic). "
                f"{works.subfield.nunique()} subfields across {works.field.nunique()} fields.")
@@ -557,44 +644,46 @@ def topic_view(n_years, end_year, groups_sel, members_sel, max_auth, scope, coun
     piv = (rows[rows.subfield.isin(top_sub)].groupby(["member", "subfield"]).wid.nunique()
            .unstack(fill_value=0).reindex(columns=list(top_sub)))
     piv = piv.loc[piv.sum(axis=1).sort_values(ascending=False).index]
-    heat = heatmap_fig(piv, "Who works on what: SIAT member by subfield (top 15 subfields)")
+    heat = heatmap_fig(piv, "Who works on what: faculty member by subfield (top 15 subfields)")
     table = (works.groupby(["topic", "subfield", "field"]).wid.nunique().reset_index(name="works")
              .merge(rows.groupby(["topic"]).member.nunique().reset_index(name="siat_members"), on="topic")
              .sort_values("works", ascending=False))
     return summary, tree, heat, table.to_dict("records")
 
 
-def finder_options(n_years, end_year, groups_sel, members_sel, max_auth):
+def finder_options(n_years, end_year, school, groups_sel, members_sel, max_auth):
     c = corpus()
     if not c["topic"]:
         return []
     start, end = window(n_years, end_year)
-    rows = topic_rows(_stamp(), start, end, max_auth, selected_members(groups_sel, members_sel), "all", None, None)
+    rows = topic_rows(_stamp(), start, end, max_auth, selected_members(groups_sel, members_sel, school),
+                      "all", None, None, school)
     cnt = rows.drop_duplicates("wid").groupby("subfield").size().sort_values(ascending=False)
     return [{"label": f"{s} ({k})", "value": s} for s, k in cnt.items()]
 
 
-def finder_view(n_years, end_year, groups_sel, members_sel, max_auth, subfield):
+def finder_view(n_years, end_year, school, groups_sel, members_sel, max_auth, subfield):
     if not subfield:
         return [], []
     c = corpus()
     start, end = window(n_years, end_year)
-    S = selected_members(groups_sel, members_sel)
-    rows = topic_rows(_stamp(), start, end, max_auth, S, "all", None, None)
+    S, M = selected_members(groups_sel, members_sel, school), school_members(school)
+    rows = topic_rows(_stamp(), start, end, max_auth, S, "all", None, None, school)
     r = rows[rows.subfield == subfield]
     mem = (r.groupby("member").wid.nunique().reset_index(name="works").sort_values("works", ascending=False))
-    mem["group"] = mem.member.map(c["groups"])
+    mem["school"] = mem.member.map(lambda m: c["people"][m]["school"])
+    mem["group"] = mem.member.map(lambda m: c["people"][m]["group"])
     people, names = defaultdict(_new_person), c["inst"]
     for wid in set(r.wid):
         ks = c["keys"][wid]
         if len(ks) > max_auth:
             continue
         present = [k for k in ks if k in S]
-        for k, (insts, ccs) in c["ext"].get(wid, {}).items():
+        for k, (insts, ccs) in externals(c, wid, M):
             p = people[k]
             p["works"].add(wid); p["members"].update(present)
             p["insts"].update(names[i][0] for i in insts); p["ctrs"].update(ccs)
-    return mem[["member", "group", "works"]].to_dict("records"), person_rows(people)[:200]
+    return mem[["member", "school", "group", "works"]].to_dict("records"), person_rows(people)[:200]
 
 
 # ------------------------------------------------------------------------- layout
@@ -611,38 +700,33 @@ def tip(**kw):
     return dict(tooltip={"always_visible": True, "placement": "bottom"}, **kw)
 
 
-def legend():
-    dot = lambda col: html.Span(style={"display": "inline-block", "width": "11px", "height": "11px",
-                                       "borderRadius": "50%", "background": col, "marginRight": "5px"})
-    items = list(GROUP_COLORS.items()) + [("Non-SIAT author", GREY)]
-    return html.Div([html.Span([dot(col), name], style={"marginRight": "18px"}) for name, col in items],
-                    style={"fontSize": "13px", "margin": "4px 0"})
-
-
-def graph_section(pfx, title, blurb, roster_names, directed):
-    opts = [{"label": " Include non-SIAT authors", "value": "ext"},
-            {"label": " Show links between non-SIAT authors", "value": "extext"},
-            {"label": " Label non-SIAT authors", "value": "labels"}]
+def graph_section(pfx, title, blurb, member_opts):
+    opts = [{"label": " Include external authors", "value": "ext"},
+            {"label": " Show links between external authors", "value": "extext"},
+            {"label": " Label external authors", "value": "labels"}]
     return html.Div([
         html.H2(title, style={"marginBottom": 2}),
         html.Div(blurb, style={"color": "#666", "fontSize": "13px"}),
         html.Div([
             ctl("Display", dcc.Checklist(id=f"{pfx}-opts", options=opts, value=["ext"])),
-            ctl("Min. ties to SIAT (non-SIAT authors)", dcc.Slider(1, 10, 1, value=2, id=f"{pfx}-minties", **tip())),
-            ctl("Max. non-SIAT authors shown", dcc.Slider(5, 200, 5, value=40, id=f"{pfx}-topn", **tip())),
+            ctl("Min. ties to members (external authors)", dcc.Slider(1, 10, 1, value=2, id=f"{pfx}-minties", **tip())),
+            ctl("Max. external authors shown", dcc.Slider(5, 200, 5, value=40, id=f"{pfx}-topn", **tip())),
             ctl("Min. edge weight", dcc.Slider(1, 10, 1, value=1, id=f"{pfx}-minedge", **tip())),
             ctl("Skip works with more authors than", dcc.Slider(5, 100, 5, value=25, id=f"{pfx}-maxauth", **tip())),
             ctl("Focus on one member (ego network)",
-                dcc.Dropdown(id=f"{pfx}-focus", options=roster_names, placeholder="All members", clearable=True)),
+                dcc.Dropdown(id=f"{pfx}-focus", options=member_opts, placeholder="All members", clearable=True)),
             ctl("Layout", dcc.Dropdown(id=f"{pfx}-layout", clearable=False, value="cose", options=[
                 {"label": "Force-directed", "value": "cose"}, {"label": "Concentric (by degree)", "value": "concentric"},
                 {"label": "Circle", "value": "circle"}, {"label": "Grid", "value": "grid"}])),
             ctl("Node size", dcc.Dropdown(id=f"{pfx}-size", clearable=False, value="scaled", options=[
                 {"label": "Scaled (works, or citations received)", "value": "scaled"},
-                {"label": "Equal for SIAT members", "value": "equal"}])),
+                {"label": "Equal for members", "value": "equal"}])),
+            ctl("Node color", dcc.Dropdown(id=f"{pfx}-color", clearable=False, value="auto", options=[
+                {"label": "Automatic (school if FCAT, else group)", "value": "auto"},
+                {"label": "By faculty group", "value": "group"}, {"label": "By school", "value": "school"}])),
             ctl("Export", html.Button("Download PNG", id=f"{pfx}-png")),
         ], style=GRID),
-        legend(),
+        html.Div(id=f"{pfx}-legend", style={"fontSize": "13px", "margin": "4px 0"}),
         html.Div(id=f"{pfx}-stats", style={"fontSize": "13px", "margin": "4px 0"}),
         cyto.Cytoscape(id=f"{pfx}-cy", elements=[], layout=LAYOUTS["cose"], minZoom=0.1, maxZoom=3,
                        style={"width": "100%", "height": "680px", "border": "1px solid #e3e6ea", "background": "#fff"}),
@@ -660,19 +744,20 @@ def dtable(id_, cols, page_size=12):
         style_table={"overflowX": "auto"})
 
 
-def expertise_section(roster_names, country_opts, inst_opts):
+def expertise_section(member_opts, country_opts, inst_opts):
     muted = {"fontSize": "13px", "color": "#555", "margin": "4px 0"}
     two = {"display": "grid", "gridTemplateColumns": "repeat(auto-fit,minmax(420px,1fr))", "gap": "12px"}
     return html.Div([
         html.H2("Collaborations and expertise", style={"marginBottom": 2}),
-        html.Div("Who SIAT faculty collaborate with, where, and on what. The filters in this block apply to everything in it "
-                 "(not to the network graphs below). Collaborators are authors who are not on the SIAT roster; a joint work is a "
-                 "work with at least one selected SIAT member and at least one author from that institution or country, counted "
-                 "once per work. Connection strength is the number of joint works.", style=muted),
+        html.Div("Who faculty collaborate with, where, and on what. The filters in this block apply to everything in it "
+                 "(not to the network graphs below). Collaborators are authors who are not faculty of the selected school; "
+                 "a joint work is a work with at least one selected faculty member and at least one author from that "
+                 "institution or country, counted once per work. Connection strength is the number of joint works.",
+                 style=muted),
         html.Div([
             ctl("Faculty groups", dcc.Checklist(id="f-groups", value=list(GROUP_COLORS),
                                                 options=[{"label": " " + g, "value": g} for g in GROUP_COLORS])),
-            ctl("Members (empty = all)", dcc.Dropdown(id="f-members", options=roster_names, multi=True,
+            ctl("Members (empty = all)", dcc.Dropdown(id="f-members", options=member_opts, multi=True,
                                                       placeholder="All members")),
             ctl("Skip works with more authors than", dcc.Slider(5, 200, 5, value=50, id="f-maxauth", **tip())),
         ], style=GRID),
@@ -689,19 +774,19 @@ def expertise_section(roster_names, country_opts, inst_opts):
         html.Div([html.Div([html.H4("Institutions"),
                             dtable("c-inst-table", [("Institution", "institution"), ("Country", "country"), ("Type", "type"),
                                                     ("Joint works", "works"), ("Collaborators", "collaborators"),
-                                                    ("SIAT members", "siat_members")])]),
+                                                    ("Faculty", "siat_members")])]),
                   html.Div([html.H4("Countries"),
                             dtable("c-country-table", [("Country", "country"), ("Joint works", "works"),
                                                        ("Collaborators", "collaborators"), ("Institutions", "institutions"),
-                                                       ("SIAT members", "siat_members")])])], style=two),
+                                                       ("Faculty", "siat_members")])])], style=two),
         dcc.Graph(id="c-heat"),
         html.H4("External collaborators"),
         dtable("c-people-table", [("Collaborator", "collaborator"), ("Institution", "institution"), ("Country", "country"),
-                                  ("Joint works", "works"), ("SIAT members", "siat_members")], page_size=15),
+                                  ("Joint works", "works"), ("Faculty", "siat_members")], page_size=15),
 
         html.H3("Topics and expertise", style={"marginTop": 28}),
         html.Div("Topics are OpenAlex's primary topic for each work, grouped as field, subfield and topic. Choose a country or "
-                 "institution to see the topics of the work SIAT shares with them.", style=muted),
+                 "institution to see the topics of the work faculty share with them.", style=muted),
         html.Div([
             ctl("Scope", dcc.RadioItems(id="t-scope", value="all", options=[
                 {"label": " All works", "value": "all"}, {"label": " Only works with external co-authors", "value": "collab"}])),
@@ -713,18 +798,19 @@ def expertise_section(roster_names, country_opts, inst_opts):
         dcc.Graph(id="t-heat"),
         html.H4("Topics"),
         dtable("t-table", [("Topic", "topic"), ("Subfield", "subfield"), ("Field", "field"), ("Works", "works"),
-                           ("SIAT members", "siat_members")], page_size=15),
+                           ("Faculty", "siat_members")], page_size=15),
 
         html.H3("Topic finder", style={"marginTop": 28}),
-        html.Div("Pick a subfield to see which SIAT members work in it and who they have co-authored with, as a starting "
+        html.Div("Pick a subfield to see which faculty work in it and who they have co-authored with, as a starting "
                  "point for introductions.", style=muted),
         ctl("Subfield", dcc.Dropdown(id="t-finder", placeholder="Choose a subfield")),
-        html.Div([html.Div([html.H4("SIAT members"),
-                            dtable("fd-mem", [("Member", "member"), ("Group", "group"), ("Works", "works")])]),
+        html.Div([html.Div([html.H4("Faculty"),
+                            dtable("fd-mem", [("Member", "member"), ("School", "school"), ("Group", "group"),
+                                              ("Works", "works")])]),
                   html.Div([html.H4("External co-authors on these works"),
                             dtable("fd-ext", [("Collaborator", "collaborator"), ("Institution", "institution"),
                                               ("Country", "country"), ("Joint works", "works"),
-                                              ("SIAT members", "siat_members")])])], style=two),
+                                              ("Faculty", "siat_members")])])], style=two),
     ], style={"marginTop": "36px"})
 
 
@@ -740,19 +826,25 @@ def serve_layout():
     span = max(2, end_default - min_y + 1)
     marks = {i: str(i) for i in range(5, span, 5)}
     marks.update({1: "1", span: "All"})
-    roster_names = [{"label": n, "value": n} for n in sorted(c["roster"])]
-    country_opts, inst_opts = _filter_options(_stamp())
+    schools = sorted({p["school"] for p in c["people"].values()})
+    school_opts = [{"label": ALL_LABEL, "value": ALL}] + [{"label": school_label(s), "value": s} for s in schools]
+    school_default = DEFAULT_SCHOOL if DEFAULT_SCHOOL in schools else ALL
+    member_opts = member_options(school_default)
+    country_opts, inst_opts = _filter_options(_stamp(), school_default)
     return html.Div([
         html.Div([
-            html.H1("SIAT research dashboard", style={"margin": "0 0 6px"}),
+            html.H1("FCAT research dashboard", style={"margin": "0 0 6px"}),
             html.Div([
+                html.Div(ctl("School", dcc.Dropdown(id="school", clearable=False, value=school_default,
+                                                    options=school_opts)),
+                         style={"flex": "1.4", "minWidth": "230px"}),
                 html.Div(ctl("Years to include (counting back from end year)",
                              dcc.Slider(1, span, 1, value=min(DEFAULT_YEARS, span), marks=marks, id="years-n", **tip())),
                          style={"flex": "3", "minWidth": "300px"}),
                 html.Div(ctl("End year", dcc.Dropdown(id="year-end", clearable=False, value=end_default,
                                                       options=list(range(max_y, min_y - 1, -1)))),
                          style={"flex": "1", "minWidth": "120px"}),
-            ], style={"display": "flex", "gap": "24px", "alignItems": "start"}),
+            ], style={"display": "flex", "gap": "24px", "alignItems": "start", "flexWrap": "wrap"}),
             html.Div(id="window-label", style={"fontSize": "13px", "color": "#555"}),
         ], style={"position": "sticky", "top": 0, "zIndex": 100, "background": "#f7f8fa",
                   "padding": "10px 0 6px", "borderBottom": "1px solid #e3e6ea"}),
@@ -764,42 +856,84 @@ def serve_layout():
                  style={"fontSize": "12px", "color": "#666"}),
         dash_table.DataTable(id="authors-table", sort_action="native", export_format="csv", page_size=30,
                              columns=[{"name": n, "id": i} for n, i in
-                                      [("Author", "author"), ("Group", "group"), ("Outputs", "outputs"),
-                                       ("Citations", "citations"), ("h-index (window)", "h_index")]],
+                                      [("Author", "author"), ("School", "school"), ("Group", "group"),
+                                       ("Outputs", "outputs"), ("Citations", "citations"),
+                                       ("h-index (window)", "h_index")]],
                              style_header={"fontWeight": 600}, style_cell={"padding": "6px", "textAlign": "left"}),
-        expertise_section(roster_names, country_opts, inst_opts),
+        expertise_section(member_opts, country_opts, inst_opts),
         graph_section("co", "Co-authorship network",
-                      "Nodes are authors (size = works in window); edges are joint works.", roster_names, False),
+                      "Nodes are authors (size = works in window); edges are joint works.", member_opts),
         graph_section("ci", "Citation network",
-                      "Arrows run from citing author to cited author, among works in the collected corpus "
-                      "(works with at least one SIAT author). Self-citations are dropped. Node size = citations received "
-                      "within the corpus.", roster_names, True),
+                      "Arrows run from citing author to cited author, among works in the selected school's corpus "
+                      "(works with at least one faculty member of that school). Self-citations are dropped. Node size = "
+                      "citations received within the corpus.", member_opts),
     ], style={"maxWidth": "1300px", "margin": "0 auto", "padding": "0 18px 60px",
               "fontFamily": "system-ui, -apple-system, Segoe UI, sans-serif"})
 
 
-app = Dash(__name__, title="SIAT dashboard")
+app = Dash(__name__, title="FCAT dashboard")
 server = app.server
 app.layout = serve_layout  # a function, so a page refresh re-reads the data
 
 
 @app.callback(Output("window-label", "children"), Output("kpis", "children"), Output("fig-out", "figure"),
               Output("fig-cit", "figure"), Output("fig-typ", "figure"), Output("authors-table", "data"),
-              Input("years-n", "value"), Input("year-end", "value"))
-def _overview(n, end):
-    return overview_view(n, end)
+              Input("years-n", "value"), Input("year-end", "value"), Input("school", "value"))
+def _overview(n, end, school):
+    return overview_view(n, end, school)
+
+
+@app.callback(Output("f-members", "options"), Output("f-members", "value"),
+              Output("t-country", "options"), Output("t-country", "value"),
+              Output("t-inst", "options"), Output("t-inst", "value"), Input("school", "value"))
+def _school_changed(school):
+    countries, institutions = _filter_options(_stamp(), school)
+    return member_options(school), None, countries, None, institutions, None
+
+
+COMMON = [Input("years-n", "value"), Input("year-end", "value"), Input("school", "value"),
+          Input("f-groups", "value"), Input("f-members", "value"), Input("f-maxauth", "value")]
+
+
+@app.callback(Output("c-summary", "children"), Output("c-inst-bar", "figure"), Output("c-inst-table", "data"),
+              Output("c-map", "figure"), Output("c-country-table", "data"), Output("c-heat", "figure"),
+              Output("c-people-table", "data"), *COMMON, Input("c-opts", "value"), Input("c-topn", "value"))
+def _collab(n, end, school, groups, members, max_auth, opts, top_n):
+    return collab_view(n, end, school, groups, members, max_auth, opts or [], top_n)
+
+
+@app.callback(Output("t-summary", "children"), Output("t-tree", "figure"), Output("t-heat", "figure"),
+              Output("t-table", "data"), *COMMON, Input("t-scope", "value"), Input("t-country", "value"),
+              Input("t-inst", "value"))
+def _topics(n, end, school, groups, members, max_auth, scope, country, inst_id):
+    return topic_view(n, end, school, groups, members, max_auth, scope, country, inst_id)
+
+
+@app.callback(Output("t-finder", "options"), *COMMON)
+def _finder_options(n, end, school, groups, members, max_auth):
+    return finder_options(n, end, school, groups, members, max_auth)
+
+
+@app.callback(Output("fd-mem", "data"), Output("fd-ext", "data"), *COMMON, Input("t-finder", "value"))
+def _finder(n, end, school, groups, members, max_auth, subfield):
+    return finder_view(n, end, school, groups, members, max_auth, subfield)
 
 
 def _register(pfx, directed):
-    inputs = [Input("years-n", "value"), Input("year-end", "value"), Input(f"{pfx}-opts", "value"),
-              Input(f"{pfx}-minties", "value"), Input(f"{pfx}-topn", "value"), Input(f"{pfx}-minedge", "value"),
-              Input(f"{pfx}-maxauth", "value"), Input(f"{pfx}-focus", "value"), Input(f"{pfx}-layout", "value"),
-              Input(f"{pfx}-size", "value")]
+    inputs = [Input("years-n", "value"), Input("year-end", "value"), Input("school", "value"),
+              Input(f"{pfx}-opts", "value"), Input(f"{pfx}-minties", "value"), Input(f"{pfx}-topn", "value"),
+              Input(f"{pfx}-minedge", "value"), Input(f"{pfx}-maxauth", "value"), Input(f"{pfx}-focus", "value"),
+              Input(f"{pfx}-layout", "value"), Input(f"{pfx}-size", "value"), Input(f"{pfx}-color", "value")]
 
     @app.callback(Output(f"{pfx}-cy", "elements"), Output(f"{pfx}-cy", "stylesheet"),
-                  Output(f"{pfx}-cy", "layout"), Output(f"{pfx}-stats", "children"), *inputs)
+                  Output(f"{pfx}-cy", "layout"), Output(f"{pfx}-stats", "children"),
+                  Output(f"{pfx}-legend", "children"), *inputs)
     def _graph(*args):
         return graph_view(directed, *args)
+
+    @app.callback(Output(f"{pfx}-focus", "options"), Output(f"{pfx}-focus", "value"), Input("school", "value"))
+    def _focus(school):
+        return member_options(school), None
 
     @app.callback(Output(f"{pfx}-info", "children"), Input(f"{pfx}-cy", "tapNodeData"))
     def _info(d):
@@ -810,35 +944,7 @@ def _register(pfx, directed):
 
     @app.callback(Output(f"{pfx}-cy", "generateImage"), Input(f"{pfx}-png", "n_clicks"), prevent_initial_call=True)
     def _png(_):
-        return {"type": "png", "action": "download", "filename": f"siat_{pfx}_network"}
-
-
-COMMON = [Input("years-n", "value"), Input("year-end", "value"), Input("f-groups", "value"),
-          Input("f-members", "value"), Input("f-maxauth", "value")]
-
-
-@app.callback(Output("c-summary", "children"), Output("c-inst-bar", "figure"), Output("c-inst-table", "data"),
-              Output("c-map", "figure"), Output("c-country-table", "data"), Output("c-heat", "figure"),
-              Output("c-people-table", "data"), *COMMON, Input("c-opts", "value"), Input("c-topn", "value"))
-def _collab(n, end, groups, members, max_auth, opts, top_n):
-    return collab_view(n, end, groups, members, max_auth, opts or [], top_n)
-
-
-@app.callback(Output("t-summary", "children"), Output("t-tree", "figure"), Output("t-heat", "figure"),
-              Output("t-table", "data"), *COMMON, Input("t-scope", "value"), Input("t-country", "value"),
-              Input("t-inst", "value"))
-def _topics(n, end, groups, members, max_auth, scope, country, inst_id):
-    return topic_view(n, end, groups, members, max_auth, scope, country, inst_id)
-
-
-@app.callback(Output("t-finder", "options"), *COMMON)
-def _finder_options(n, end, groups, members, max_auth):
-    return finder_options(n, end, groups, members, max_auth)
-
-
-@app.callback(Output("fd-mem", "data"), Output("fd-ext", "data"), *COMMON, Input("t-finder", "value"))
-def _finder(n, end, groups, members, max_auth, subfield):
-    return finder_view(n, end, groups, members, max_auth, subfield)
+        return {"type": "png", "action": "download", "filename": f"fcat_{pfx}_network"}
 
 
 _register("co", False)
